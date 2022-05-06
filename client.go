@@ -1,8 +1,11 @@
-package grpctunnel
+package rgrpc
 
 import (
 	"errors"
 	"fmt"
+	"io"
+	"sync"
+
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/empty"
 	"golang.org/x/net/context"
@@ -11,73 +14,60 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
-	"io"
-	"sync"
 )
 
-func NewChannel(stream TunnelService_OpenTunnelClient) *TunnelChannel {
-	return newTunnelChannel(stream, stream.CloseSend)
+func NewClientChannel(stream RgrpcService_OpenRgrpcServer) *ClientChannel {
+	return newClientChannel(stream)
 }
 
-func NewReverseChannel(stream TunnelService_OpenReverseTunnelServer) *ReverseTunnelChannel {
-	p, _ := peer.FromContext(stream.Context())
-	md, _ := metadata.FromIncomingContext(stream.Context())
-	ch := newTunnelChannel(stream, nil)
-	return &ReverseTunnelChannel{
-		TunnelChannel:  ch,
-		Peer:           p,
-		RequestHeaders: md,
-	}
-}
-
-type ReverseTunnelChannel struct {
-	*TunnelChannel
-	Peer           *peer.Peer
-	RequestHeaders metadata.MD
-}
-
-type tunnelStreamClient interface {
+type streamClient interface {
 	grpc.Stream
 	Send(*ClientToServer) error
 	Recv() (*ServerToClient, error)
 }
 
-type TunnelChannel struct {
-	stream   tunnelStreamClient
-	ctx      context.Context
-	cancel   context.CancelFunc
-	tearDown func() error
+type ClientChannel struct {
+	stream streamClient
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	mu            sync.RWMutex
-	streams       map[int64]*tunnelClientStream
+	streams       map[int64]*clientStream
 	lastStreamID  int64
 	streamCreated bool
 	err           error
 	finished      bool
+
+	Peer           *peer.Peer
+	RequestHeaders metadata.MD
 }
 
-func newTunnelChannel(stream tunnelStreamClient, tearDown func() error) *TunnelChannel {
+func newClientChannel(stream streamClient) *ClientChannel {
+	p, _ := peer.FromContext(stream.Context())
+	md, _ := metadata.FromIncomingContext(stream.Context())
+
 	ctx, cancel := context.WithCancel(stream.Context())
-	c := &TunnelChannel{
-		stream:   stream,
-		ctx:      ctx,
-		cancel:   cancel,
-		tearDown: tearDown,
-		streams:  map[int64]*tunnelClientStream{},
+	c := &ClientChannel{
+		stream:         stream,
+		ctx:            ctx,
+		cancel:         cancel,
+		streams:        map[int64]*clientStream{},
+		Peer:           p,
+		RequestHeaders: md,
 	}
 	go c.recvLoop()
 	return c
 }
 
-func (c *TunnelChannel) Context() context.Context {
+func (c *ClientChannel) Context() context.Context {
 	return c.ctx
 }
 
-func (c *TunnelChannel) Done() <-chan struct{} {
+func (c *ClientChannel) Done() <-chan struct{} {
 	return c.ctx.Done()
 }
 
-func (c *TunnelChannel) IsDone() bool {
+func (c *ClientChannel) IsDone() bool {
 	if c.ctx.Err() != nil {
 		return true
 	}
@@ -86,7 +76,7 @@ func (c *TunnelChannel) IsDone() bool {
 	return c.finished
 }
 
-func (c *TunnelChannel) Err() error {
+func (c *ClientChannel) Err() error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	switch c.err {
@@ -99,11 +89,11 @@ func (c *TunnelChannel) Err() error {
 	}
 }
 
-func (c *TunnelChannel) Close() {
+func (c *ClientChannel) Close() {
 	c.close(nil)
 }
 
-func (c *TunnelChannel) Invoke(ctx context.Context, methodName string, req, resp interface{}, opts ...grpc.CallOption) error {
+func (c *ClientChannel) Invoke(ctx context.Context, methodName string, req, resp interface{}, opts ...grpc.CallOption) error {
 	str, err := c.newStream(ctx, false, false, methodName, opts...)
 	if err != nil {
 		return err
@@ -117,11 +107,11 @@ func (c *TunnelChannel) Invoke(ctx context.Context, methodName string, req, resp
 	return str.RecvMsg(resp)
 }
 
-func (c *TunnelChannel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodName string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+func (c *ClientChannel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodName string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 	return c.newStream(ctx, desc.ClientStreams, desc.ServerStreams, methodName, opts...)
 }
 
-func (c *TunnelChannel) newStream(ctx context.Context, clientStreams, serverStreams bool, methodName string, opts ...grpc.CallOption) (*tunnelClientStream, error) {
+func (c *ClientChannel) newStream(ctx context.Context, clientStreams, serverStreams bool, methodName string, opts ...grpc.CallOption) (*clientStream, error) {
 	str, md, err := c.allocateStream(ctx, clientStreams, serverStreams, methodName, opts)
 	if err != nil {
 		return nil, err
@@ -148,7 +138,7 @@ func (c *TunnelChannel) newStream(ctx context.Context, clientStreams, serverStre
 	return str, nil
 }
 
-func (c *TunnelChannel) allocateStream(ctx context.Context, clientStreams, serverStreams bool, methodName string, opts []grpc.CallOption) (*tunnelClientStream, metadata.MD, error) {
+func (c *ClientChannel) allocateStream(ctx context.Context, clientStreams, serverStreams bool, methodName string, opts []grpc.CallOption) (*clientStream, metadata.MD, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -213,7 +203,7 @@ func (c *TunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 
 	ch := make(chan isServerToClient_Frame, 1)
 	ctx, cncl := context.WithCancel(ctx)
-	str := &tunnelClientStream{
+	str := &clientStream{
 		ctx:              ctx,
 		cncl:             cncl,
 		ch:               c,
@@ -234,7 +224,7 @@ func (c *TunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 	return str, md, nil
 }
 
-func (c *TunnelChannel) recvLoop() {
+func (c *ClientChannel) recvLoop() {
 	for {
 		in, err := c.stream.Recv()
 		if err != nil {
@@ -250,7 +240,7 @@ func (c *TunnelChannel) recvLoop() {
 	}
 }
 
-func (c *TunnelChannel) getStream(streamID int64) (*tunnelClientStream, error) {
+func (c *ClientChannel) getStream(streamID int64) (*clientStream, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -267,7 +257,7 @@ func (c *TunnelChannel) getStream(streamID int64) (*tunnelClientStream, error) {
 	return target, nil
 }
 
-func (c *TunnelChannel) removeStream(streamID int64) {
+func (c *ClientChannel) removeStream(streamID int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.streams != nil {
@@ -275,11 +265,7 @@ func (c *TunnelChannel) removeStream(streamID int64) {
 	}
 }
 
-func (c *TunnelChannel) close(err error) bool {
-	if c.tearDown != nil {
-		c.tearDown()
-	}
-
+func (c *ClientChannel) close(err error) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -301,13 +287,13 @@ func (c *TunnelChannel) close(err error) bool {
 	return true
 }
 
-type tunnelClientStream struct {
+type clientStream struct {
 	ctx      context.Context
 	cncl     context.CancelFunc
-	ch       *TunnelChannel
+	ch       *ClientChannel
 	streamID int64
 	method   string
-	stream   tunnelStreamClient
+	stream   streamClient
 
 	headersTargets  []*metadata.MD
 	trailersTargets []*metadata.MD
@@ -336,7 +322,7 @@ type tunnelClientStream struct {
 	halfClosed bool
 }
 
-func (st *tunnelClientStream) Header() (metadata.MD, error) {
+func (st *clientStream) Header() (metadata.MD, error) {
 	// if we've already received headers, return them
 	select {
 	case <-st.gotHeadersSignal:
@@ -358,7 +344,7 @@ func (st *tunnelClientStream) Header() (metadata.MD, error) {
 	}
 }
 
-func (st *tunnelClientStream) Trailer() metadata.MD {
+func (st *clientStream) Trailer() metadata.MD {
 	// Unlike Header(), this method does not block and should only be
 	// used by client after stream is closed.
 	select {
@@ -369,7 +355,7 @@ func (st *tunnelClientStream) Trailer() metadata.MD {
 	}
 }
 
-func (st *tunnelClientStream) CloseSend() error {
+func (st *clientStream) CloseSend() error {
 	st.writeMu.Lock()
 	defer st.writeMu.Unlock()
 
@@ -392,16 +378,16 @@ func (st *tunnelClientStream) CloseSend() error {
 	})
 }
 
-func (st *tunnelClientStream) Context() context.Context {
+func (st *clientStream) Context() context.Context {
 	return st.ctx
 }
 
-func (st *tunnelClientStream) SendMsg(m interface{}) error {
+func (st *clientStream) SendMsg(m interface{}) error {
 	st.writeMu.Lock()
 	defer st.writeMu.Unlock()
 
 	if !st.isClientStream && st.numSent == 1 {
-		return status.Errorf(codes.Internal, "Already sent response for non-server-stream method %d", st.method)
+		return status.Errorf(codes.Internal, "Already sent response for non-server-stream method %v", st.method)
 	}
 	st.numSent++
 
@@ -456,8 +442,8 @@ func (st *tunnelClientStream) SendMsg(m interface{}) error {
 	return nil
 }
 
-func (st *tunnelClientStream) RecvMsg(m interface{}) error {
-	data, err, ok := st.readMsg()
+func (st *clientStream) RecvMsg(m interface{}) error {
+	data, ok, err := st.readMsg()
 	if err != nil {
 		if !ok {
 			st.cancel(err)
@@ -468,31 +454,31 @@ func (st *tunnelClientStream) RecvMsg(m interface{}) error {
 	return proto.Unmarshal(data, m.(proto.Message))
 }
 
-func (st *tunnelClientStream) readMsg() (data []byte, err error, ok bool) {
+func (st *clientStream) readMsg() (data []byte, ok bool, err error) {
 	st.readMu.Lock()
 	defer st.readMu.Unlock()
 
-	data, err, ok = st.readMsgLocked()
+	data, ok, err = st.readMsgLocked()
 	if err == nil && !st.isServerStream {
 		// no stream; so eagerly see if there's another message
 		// and fail RPC if so (due to bad input)
-		_, err, ok := st.readMsgLocked()
+		_, ok, err := st.readMsgLocked()
 		if err == nil {
-			err = status.Errorf(codes.Internal, "Server sent multiple responses for non-server-stream method %d", st.method)
+			err = status.Errorf(codes.Internal, "Server sent multiple responses for non-server-stream method %v", st.method)
 			st.readErr = err
-			return nil, err, false
+			return nil, false, err
 		}
 		if err != io.EOF || !ok {
-			return nil, err, ok
+			return nil, ok, err
 		}
 	}
 
-	return data, err, ok
+	return data, ok, err
 }
 
-func (st *tunnelClientStream) readMsgLocked() (data []byte, err error, ok bool) {
+func (st *clientStream) readMsgLocked() (data []byte, ok bool, err error) {
 	if st.readErr != nil {
-		return nil, st.readErr, true
+		return nil, true, st.readErr
 	}
 
 	defer func() {
@@ -508,42 +494,42 @@ func (st *tunnelClientStream) readMsgLocked() (data []byte, err error, ok bool) 
 		if !ok {
 			// don't need lock to read st.done; observing
 			// input channel close provides safe visibility
-			return nil, st.done, true
+			return nil, true, st.done
 		}
 
 		switch in := in.(type) {
 		case *ServerToClient_ResponseMessage:
 			if msgLen != -1 {
-				return nil, status.Errorf(codes.Internal, "server sent redundant response message envelope"), false
+				return nil, false, status.Errorf(codes.Internal, "server sent redundant response message envelope")
 			}
 			msgLen = int(in.ResponseMessage.Size)
 			b = in.ResponseMessage.Data
 			if len(b) > msgLen {
-				return nil, status.Errorf(codes.Internal, "server sent more data than indicated by response message envelope"), false
+				return nil, false, status.Errorf(codes.Internal, "server sent more data than indicated by response message envelope")
 			}
 			if len(b) == msgLen {
-				return b, nil, true
+				return b, true, nil
 			}
 
 		case *ServerToClient_MoreResponseData:
 			if msgLen == -1 {
-				return nil, status.Errorf(codes.Internal, "server never sent envelope for response message"), false
+				return nil, false, status.Errorf(codes.Internal, "server never sent envelope for response message")
 			}
 			b = append(b, in.MoreResponseData...)
 			if len(b) > msgLen {
-				return nil, status.Errorf(codes.Internal, "server sent more data than indicated by response message envelope"), false
+				return nil, false, status.Errorf(codes.Internal, "server sent more data than indicated by response message envelope")
 			}
 			if len(b) == msgLen {
-				return b, nil, true
+				return b, true, nil
 			}
 
 		default:
-			return nil, status.Errorf(codes.Internal, "unrecognized frame type: %T", in), false
+			return nil, false, status.Errorf(codes.Internal, "unrecognized frame type: %T", in)
 		}
 	}
 }
 
-func (st *tunnelClientStream) err() error {
+func (st *clientStream) err() error {
 	select {
 	case <-st.doneSignal:
 		return st.done
@@ -552,7 +538,7 @@ func (st *tunnelClientStream) err() error {
 	}
 }
 
-func (st *tunnelClientStream) acceptServerFrame(frame isServerToClient_Frame) {
+func (st *clientStream) acceptServerFrame(frame isServerToClient_Frame) {
 	if st == nil {
 		// can happen if client decided that the stream ID was recently used
 		// yet inactive -- it returns nil error but also nil stream, which
@@ -596,7 +582,7 @@ func (st *tunnelClientStream) acceptServerFrame(frame isServerToClient_Frame) {
 	}
 }
 
-func (st *tunnelClientStream) cancel(err error) {
+func (st *clientStream) cancel(err error) {
 	st.finishStream(err, nil)
 	// let server know
 	st.writeMu.Lock()
@@ -609,7 +595,7 @@ func (st *tunnelClientStream) cancel(err error) {
 	})
 }
 
-func (st *tunnelClientStream) finishStream(err error, trailers metadata.MD) {
+func (st *clientStream) finishStream(err error, trailers metadata.MD) {
 	st.ch.removeStream(st.streamID)
 	defer st.cncl()
 

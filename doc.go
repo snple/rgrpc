@@ -10,6 +10,4 @@
 // connection to a server and subsequently the server can then wrap that
 // connection with an RPC stub, used to send requests from the server to that
 // client (and the client then replies and sends responses back to the server).
-package grpctunnel
-
-//go:generate protoc -I ./googleapis/ -I $GOPATH/src --go_out=plugins=grpc:$GOPATH/src github.com/jhump/grpctunnel/tunnel.proto
+package rgrpc

@@ -1,13 +1,13 @@
-package grpctunnel
+package rgrpc
 
 import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 
-	"github.com/fullstorydev/grpchan"
 	"github.com/golang/protobuf/proto"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -18,26 +18,7 @@ import (
 
 const maxChunkSize = 16384
 
-// ServeTunnel uses the given services to handle incoming RPC requests that
-// arrive via the given incoming tunnel stream.
-//
-// It returns if, in the process of reading requests, it detects invalid usage
-// of the stream (client sending references to invalid stream IDs or sending
-// frames for a stream ID in improper order) or if the stream itself fails (for
-// example, if the client cancels the tunnel or there is a network disruption).
-//
-// This is typically called from a handler that implements the TunnelService.
-// Typical usage looks like so:
-//
-//    func (h tunnelHandler) OpenTunnel(stream grpctunnel.TunnelService_OpenTunnelServer) error {
-//        return grpctunnel.ServeTunnel(stream, h.handlers)
-//    }
-//
-func ServeTunnel(stream TunnelService_OpenTunnelServer, handlers grpchan.HandlerMap) error {
-	return serveTunnel(stream, handlers)
-}
-
-// ServeReverseTunnel uses the given services to handle incoming RPC requests
+// ServeChannel uses the given services to handle incoming RPC requests
 // that arrive via the given client tunnel stream. Since this is a reverse
 // tunnel, RPC requests are initiated by the server, and this end (the client)
 // processes the requests and sends responses.
@@ -52,14 +33,14 @@ func ServeTunnel(stream TunnelService_OpenTunnelServer, handlers grpchan.Handler
 //
 //    ctx, cancel := context.WithCancel(ctx)
 //    defer cancel()
-//    stream, err := stub.OpenReverseTunnel(ctx)
+//    stream, err := stub.OpenRgrpc(ctx)
 //    if err != nil {
 //        return err
 //    }
-//    return grpctunnel.ServeReverseTunnel(stream, handlers)
+//    return rgrpc.ServeChannel(stream, handlers)
 //
-func ServeReverseTunnel(stream TunnelService_OpenReverseTunnelClient, handlers grpchan.HandlerMap) error {
-	return serveTunnel(stream, handlers)
+func ServeChannel(stream RgrpcService_OpenRgrpcClient, handlers HandlerMap) error {
+	return serveChannel(stream, handlers)
 }
 
 // TODO: how to expose API to allow for graceful shutdown? Maybe above functions
@@ -68,32 +49,32 @@ func ServeReverseTunnel(stream TunnelService_OpenReverseTunnelClient, handlers g
 // channel is in graceful-stopping mode, it could immediately fail them with an
 // "unavailable" response code.
 
-func serveTunnel(stream tunnelStreamServer, handlers grpchan.HandlerMap) error {
-	svr := &tunnelServer{
+func serveChannel(stream streamServer, handlers HandlerMap) error {
+	svr := &ServerChannel{
 		stream:   stream,
 		services: handlers,
-		streams:  map[int64]*tunnelServerStream{},
+		streams:  map[int64]*serverStream{},
 		lastSeen: -1,
 	}
 	return svr.serve()
 }
 
-type tunnelStreamServer interface {
+type streamServer interface {
 	grpc.Stream
 	Send(*ServerToClient) error
 	Recv() (*ClientToServer, error)
 }
 
-type tunnelServer struct {
-	stream   tunnelStreamServer
-	services grpchan.HandlerMap
+type ServerChannel struct {
+	stream   streamServer
+	services HandlerMap
 
 	mu       sync.RWMutex
-	streams  map[int64]*tunnelServerStream
+	streams  map[int64]*serverStream
 	lastSeen int64
 }
 
-func (s *tunnelServer) serve() error {
+func (s *ServerChannel) serve() error {
 	ctx, cancel := context.WithCancel(s.stream.Context())
 	defer cancel()
 	for {
@@ -106,21 +87,22 @@ func (s *tunnelServer) serve() error {
 		}
 
 		if f, ok := in.Frame.(*ClientToServer_NewStream); ok {
-			if err, ok := s.createStream(ctx, in.StreamId, f.NewStream); err != nil {
+			if ok, err := s.createStream(ctx, in.StreamId, f.NewStream); err != nil {
 				if !ok {
 					return err
-				} else {
-					st, _ := status.FromError(err)
-					s.stream.Send(&ServerToClient{
-						StreamId: in.StreamId,
-						Frame: &ServerToClient_CloseStream{
-							CloseStream: &CloseStream{
-								Status: st.Proto(),
-							},
-						},
-					})
 				}
+
+				st, _ := status.FromError(err)
+				s.stream.Send(&ServerToClient{
+					StreamId: in.StreamId,
+					Frame: &ServerToClient_CloseStream{
+						CloseStream: &CloseStream{
+							Status: st.Proto(),
+						},
+					},
+				})
 			}
+
 			continue
 		}
 
@@ -132,17 +114,17 @@ func (s *tunnelServer) serve() error {
 	}
 }
 
-func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *NewStream) (error, bool) {
+func (s *ServerChannel) createStream(ctx context.Context, streamID int64, frame *NewStream) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	_, ok := s.streams[streamID]
 	if ok {
 		// stream already active!
-		return fmt.Errorf("cannot create stream ID %d: already exists", streamID), false
+		return false, fmt.Errorf("cannot create stream ID %d: already exists", streamID)
 	}
 	if streamID <= s.lastSeen {
-		return fmt.Errorf("cannot create stream ID %d: that ID has already been used", streamID), false
+		return false, fmt.Errorf("cannot create stream ID %d: that ID has already been used", streamID)
 	}
 	s.lastSeen = streamID
 
@@ -151,44 +133,71 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	}
 	parts := strings.SplitN(frame.MethodName, "/", 2)
 	if len(parts) != 2 {
-		return status.Errorf(codes.InvalidArgument, "%s is not a well-formed method name", frame.MethodName), true
-	}
-	var md interface{}
-	sd, svc := s.services.QueryService(parts[0])
-	if sd != nil {
-		md = findMethod(sd, parts[1])
-	}
-	var isClientStream, isServerStream bool
-	if streamDesc, ok := md.(*grpc.StreamDesc); ok {
-		isClientStream, isServerStream = streamDesc.ClientStreams, streamDesc.ServerStreams
+		return true, status.Errorf(codes.InvalidArgument, "%s is not a well-formed method name", frame.MethodName)
 	}
 
-	if md == nil {
-		delete(s.streams, streamID)
-		return status.Errorf(codes.Unimplemented, "%s not implemented", frame.MethodName), true
+	service := parts[0]
+	method := parts[1]
+
+	srv, knownService := s.services[service]
+	if knownService {
+		if md, ok := srv.methods[method]; ok {
+			s.processUnaryRPC(ctx, streamID, frame, md, srv)
+			return true, nil
+		}
+		if sd, ok := srv.streams[method]; ok {
+			s.processStreamingRPC(ctx, streamID, frame, sd, srv)
+			return true, nil
+		}
 	}
 
+	delete(s.streams, streamID)
+	return true, status.Errorf(codes.Unimplemented, "%s not implemented", frame.MethodName)
+}
+
+func (s *ServerChannel) processUnaryRPC(ctx context.Context, streamID int64, frame *NewStream, md *grpc.MethodDesc, srv *serviceInfo) {
 	ctx = metadata.NewIncomingContext(ctx, fromProto(frame.RequestHeaders))
 
 	ch := make(chan isClientToServer_Frame, 1)
-	str := &tunnelServerStream{
+	str := &serverStream{
 		ctx:            ctx,
 		svr:            s,
 		streamID:       streamID,
 		method:         frame.MethodName,
 		stream:         s.stream,
-		isClientStream: isClientStream,
-		isServerStream: isServerStream,
+		isClientStream: false,
+		isServerStream: false,
 		readChan:       ch,
 		ingestChan:     ch,
 	}
 	s.streams[streamID] = str
-	str.ctx = grpc.NewContextWithServerTransportStream(str.ctx, (*tunnelServerTransportStream)(str))
-	go str.serveStream(md, svc)
-	return nil, true
+	str.ctx = grpc.NewContextWithServerTransportStream(str.ctx, (*serverChannelTransportStream)(str))
+
+	go str.processUnaryRPC(md, srv.serviceImpl)
 }
 
-func (s *tunnelServer) getStream(streamID int64) (*tunnelServerStream, error) {
+func (s *ServerChannel) processStreamingRPC(ctx context.Context, streamID int64, frame *NewStream, sd *grpc.StreamDesc, srv *serviceInfo) {
+	ctx = metadata.NewIncomingContext(ctx, fromProto(frame.RequestHeaders))
+
+	ch := make(chan isClientToServer_Frame, 1)
+	str := &serverStream{
+		ctx:            ctx,
+		svr:            s,
+		streamID:       streamID,
+		method:         frame.MethodName,
+		stream:         s.stream,
+		isClientStream: sd.ClientStreams,
+		isServerStream: sd.ServerStreams,
+		readChan:       ch,
+		ingestChan:     ch,
+	}
+	s.streams[streamID] = str
+	str.ctx = grpc.NewContextWithServerTransportStream(str.ctx, (*serverChannelTransportStream)(str))
+
+	go str.processStreamingRPC(sd, srv.serviceImpl)
+}
+
+func (s *ServerChannel) getStream(streamID int64) (*serverStream, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -205,7 +214,7 @@ func (s *tunnelServer) getStream(streamID int64) (*tunnelServerStream, error) {
 	return target, nil
 }
 
-func (s *tunnelServer) removeStream(streamID int64) {
+func (s *ServerChannel) removeStream(streamID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.streams, streamID)
@@ -225,12 +234,12 @@ func findMethod(sd *grpc.ServiceDesc, method string) interface{} {
 	return nil
 }
 
-type tunnelServerStream struct {
+type serverStream struct {
 	ctx      context.Context
-	svr      *tunnelServer
+	svr      *ServerChannel
 	streamID int64
 	method   string
-	stream   tunnelStreamServer
+	stream   streamServer
 
 	isClientStream bool
 	isServerStream bool
@@ -254,7 +263,7 @@ type tunnelServerStream struct {
 	closed      bool
 }
 
-func (st *tunnelServerStream) acceptClientFrame(frame isClientToServer_Frame) {
+func (st *serverStream) acceptClientFrame(frame isClientToServer_Frame) {
 	if st == nil {
 		// can happen if server decided that the stream ID was recently used
 		// yet inactive -- it returns nil error but also nil stream, which
@@ -287,15 +296,15 @@ func (st *tunnelServerStream) acceptClientFrame(frame isClientToServer_Frame) {
 	}
 }
 
-func (st *tunnelServerStream) SetHeader(md metadata.MD) error {
+func (st *serverStream) SetHeader(md metadata.MD) error {
 	return st.setHeader(md, false)
 }
 
-func (st *tunnelServerStream) SendHeader(md metadata.MD) error {
+func (st *serverStream) SendHeader(md metadata.MD) error {
 	return st.setHeader(md, true)
 }
 
-func (st *tunnelServerStream) setHeader(md metadata.MD, send bool) error {
+func (st *serverStream) setHeader(md metadata.MD, send bool) error {
 	st.writeMu.Lock()
 	defer st.writeMu.Unlock()
 
@@ -311,7 +320,7 @@ func (st *tunnelServerStream) setHeader(md metadata.MD, send bool) error {
 	return nil
 }
 
-func (st *tunnelServerStream) sendHeadersLocked() error {
+func (st *serverStream) sendHeadersLocked() error {
 	err := st.stream.Send(&ServerToClient{
 		StreamId: st.streamID,
 		Frame: &ServerToClient_ResponseHeaders{
@@ -342,11 +351,11 @@ func toProto(md metadata.MD) *Metadata {
 	return &Metadata{Md: vals}
 }
 
-func (st *tunnelServerStream) SetTrailer(md metadata.MD) {
+func (st *serverStream) SetTrailer(md metadata.MD) {
 	st.setTrailer(md)
 }
 
-func (st *tunnelServerStream) setTrailer(md metadata.MD) error {
+func (st *serverStream) setTrailer(md metadata.MD) error {
 	st.writeMu.Lock()
 	defer st.writeMu.Unlock()
 
@@ -357,11 +366,11 @@ func (st *tunnelServerStream) setTrailer(md metadata.MD) error {
 	return nil
 }
 
-func (st *tunnelServerStream) Context() context.Context {
+func (st *serverStream) Context() context.Context {
 	return st.ctx
 }
 
-func (st *tunnelServerStream) SendMsg(m interface{}) error {
+func (st *serverStream) SendMsg(m interface{}) error {
 	st.writeMu.Lock()
 	defer st.writeMu.Unlock()
 
@@ -370,7 +379,7 @@ func (st *tunnelServerStream) SendMsg(m interface{}) error {
 	}
 
 	if !st.isServerStream && st.numSent == 1 {
-		return status.Errorf(codes.Internal, "Already sent response for non-server-stream method %d", st.method)
+		return status.Errorf(codes.Internal, "Already sent response for non-server-stream method %v", st.method)
 	}
 	st.numSent++
 
@@ -425,8 +434,8 @@ func (st *tunnelServerStream) SendMsg(m interface{}) error {
 	return nil
 }
 
-func (st *tunnelServerStream) RecvMsg(m interface{}) error {
-	data, err, ok := st.readMsg()
+func (st *serverStream) RecvMsg(m interface{}) error {
+	data, ok, err := st.readMsg()
 	if err != nil {
 		if !ok {
 			st.finishStream(err)
@@ -437,31 +446,31 @@ func (st *tunnelServerStream) RecvMsg(m interface{}) error {
 	return proto.Unmarshal(data, m.(proto.Message))
 }
 
-func (st *tunnelServerStream) readMsg() (data []byte, err error, ok bool) {
+func (st *serverStream) readMsg() (data []byte, ok bool, err error) {
 	st.readMu.Lock()
 	defer st.readMu.Unlock()
 
-	data, err, ok = st.readMsgLocked()
+	data, ok, err = st.readMsgLocked()
 	if err == nil && !st.isClientStream {
 		// no stream; so eagerly see if there's another message
 		// and fail RPC if so (due to bad input)
-		_, err, ok := st.readMsgLocked()
+		_, ok, err := st.readMsgLocked()
 		if err == nil {
-			err = status.Errorf(codes.InvalidArgument, "Already received request for non-client-stream method %d", st.method)
+			err = status.Errorf(codes.InvalidArgument, "Already received request for non-client-stream method %v", st.method)
 			st.readErr = err
-			return nil, err, false
+			return nil, false, err
 		}
 		if err != io.EOF || !ok {
-			return nil, err, ok
+			return nil, ok, err
 		}
 	}
 
-	return data, err, ok
+	return data, ok, err
 }
 
-func (st *tunnelServerStream) readMsgLocked() (data []byte, err error, ok bool) {
+func (st *serverStream) readMsgLocked() (data []byte, ok bool, err error) {
 	if st.readErr != nil {
-		return nil, st.readErr, true
+		return nil, true, st.readErr
 	}
 
 	defer func() {
@@ -475,56 +484,56 @@ func (st *tunnelServerStream) readMsgLocked() (data []byte, err error, ok bool) 
 	for {
 		// if stream is canceled, return context error
 		if err := st.ctx.Err(); err != nil {
-			return nil, err, true
+			return nil, true, err
 		}
 
 		// otherwise, try to read request data, but interrupt if
 		// stream is canceled or half-closed
 		select {
 		case <-st.ctx.Done():
-			return nil, st.ctx.Err(), true
+			return nil, true, st.ctx.Err()
 
 		case in, ok := <-st.readChan:
 			if !ok {
 				// don't need lock to read st.halfClosed; observing
 				// input channel close provides safe visibility
-				return nil, st.halfClosed, true
+				return nil, true, st.halfClosed
 			}
 
 			switch in := in.(type) {
 			case *ClientToServer_RequestMessage:
 				if msgLen != -1 {
-					return nil, status.Errorf(codes.InvalidArgument, "received redundant request message envelope"), false
+					return nil, false, status.Errorf(codes.InvalidArgument, "received redundant request message envelope")
 				}
 				msgLen = int(in.RequestMessage.Size)
 				b = in.RequestMessage.Data
 				if len(b) > msgLen {
-					return nil, status.Errorf(codes.InvalidArgument, "received more data than indicated by request message envelope"), false
+					return nil, false, status.Errorf(codes.InvalidArgument, "received more data than indicated by request message envelope")
 				}
 				if len(b) == msgLen {
-					return b, nil, true
+					return b, true, nil
 				}
 
 			case *ClientToServer_MoreRequestData:
 				if msgLen == -1 {
-					return nil, status.Errorf(codes.InvalidArgument, "never received envelope for request message"), false
+					return nil, false, status.Errorf(codes.InvalidArgument, "never received envelope for request message")
 				}
 				b = append(b, in.MoreRequestData...)
 				if len(b) > msgLen {
-					return nil, status.Errorf(codes.InvalidArgument, "received more data than indicated by request message envelope"), false
+					return nil, false, status.Errorf(codes.InvalidArgument, "received more data than indicated by request message envelope")
 				}
 				if len(b) == msgLen {
-					return b, nil, true
+					return b, true, nil
 				}
 
 			default:
-				return nil, status.Errorf(codes.InvalidArgument, "unrecognized frame type: %T", in), false
+				return nil, false, status.Errorf(codes.InvalidArgument, "unrecognized frame type: %T", in)
 			}
 		}
 	}
 }
 
-func (st *tunnelServerStream) serveStream(md interface{}, srv interface{}) {
+func (st *serverStream) processUnaryRPC(md *grpc.MethodDesc, srv interface{}) {
 	var err error
 	panicked := true // pessimistic assumption
 
@@ -535,23 +544,34 @@ func (st *tunnelServerStream) serveStream(md interface{}, srv interface{}) {
 		st.finishStream(err)
 	}()
 
-	switch md := md.(type) {
-	case *grpc.MethodDesc:
-		var resp interface{}
-		resp, err = md.Handler(srv, st.ctx, st.RecvMsg, nil)
-		if err == nil {
-			err = st.SendMsg(resp)
-		}
-	case *grpc.StreamDesc:
-		err = md.Handler(srv, st)
-	default:
-		err = status.Errorf(codes.Internal, "unknown type of method desc: %T", md)
+	var resp interface{}
+	resp, err = md.Handler(srv, st.ctx, st.RecvMsg, nil)
+	if err == nil {
+		err = st.SendMsg(resp)
 	}
+
 	// if we get here, we did not panic
 	panicked = false
 }
 
-func (st *tunnelServerStream) finishStream(err error) {
+func (st *serverStream) processStreamingRPC(sd *grpc.StreamDesc, srv interface{}) {
+	var err error
+	panicked := true // pessimistic assumption
+
+	defer func() {
+		if err == nil && panicked {
+			err = status.Errorf(codes.Internal, "panic")
+		}
+		st.finishStream(err)
+	}()
+
+	err = sd.Handler(srv, st)
+
+	// if we get here, we did not panic
+	panicked = false
+}
+
+func (st *serverStream) finishStream(err error) {
 	st.svr.removeStream(st.streamID)
 
 	st.halfClose(err)
@@ -582,7 +602,7 @@ func (st *tunnelServerStream) finishStream(err error) {
 	st.trailers = nil
 }
 
-func (st *tunnelServerStream) halfClose(err error) {
+func (st *serverStream) halfClose(err error) {
 	st.ingestMu.Lock()
 	defer st.ingestMu.Unlock()
 
@@ -598,20 +618,101 @@ func (st *tunnelServerStream) halfClose(err error) {
 	close(st.ingestChan)
 }
 
-type tunnelServerTransportStream tunnelServerStream
+type serverChannelTransportStream serverStream
 
-func (st *tunnelServerTransportStream) Method() string {
-	return (*tunnelServerStream)(st).method
+func (st *serverChannelTransportStream) Method() string {
+	return (*serverStream)(st).method
 }
 
-func (st *tunnelServerTransportStream) SetHeader(md metadata.MD) error {
-	return (*tunnelServerStream)(st).SetHeader(md)
+func (st *serverChannelTransportStream) SetHeader(md metadata.MD) error {
+	return (*serverStream)(st).SetHeader(md)
 }
 
-func (st *tunnelServerTransportStream) SendHeader(md metadata.MD) error {
-	return (*tunnelServerStream)(st).SendHeader(md)
+func (st *serverChannelTransportStream) SendHeader(md metadata.MD) error {
+	return (*serverStream)(st).SendHeader(md)
 }
 
-func (st *tunnelServerTransportStream) SetTrailer(md metadata.MD) error {
-	return (*tunnelServerStream)(st).setTrailer(md)
+func (st *serverChannelTransportStream) SetTrailer(md metadata.MD) error {
+	return (*serverStream)(st).setTrailer(md)
+}
+
+// HandlerMap is used to accumulate service handlers into a map. The handlers
+// can be registered once in the map, and then re-used to configure multiple
+// servers that should expose the same handlers. HandlerMap can also be used
+// as the internal store of registered handlers for a server implementation.
+type HandlerMap map[string]*serviceInfo
+
+// serviceInfo wraps information about a service. It is very similar to
+// ServiceDesc and is constructed from it for internal purposes.
+type serviceInfo struct {
+	// Contains the implementation for the methods in this service.
+	serviceImpl interface{}
+	methods     map[string]*grpc.MethodDesc
+	streams     map[string]*grpc.StreamDesc
+	mdata       interface{}
+}
+
+// RegisterService registers a service and its implementation to the gRPC
+// server. It is called from the IDL generated code. This must be called before
+// invoking Serve. If ss is non-nil (for legacy code), its type is checked to
+// ensure it implements sd.HandlerType.
+func (m HandlerMap) RegisterService(desc *grpc.ServiceDesc, ss interface{}) {
+	if ss != nil {
+		ht := reflect.TypeOf(desc.HandlerType).Elem()
+		st := reflect.TypeOf(ss)
+		if !st.Implements(ht) {
+			panic(fmt.Sprintf("service %s: handler of type %v does not satisfy %v", desc.ServiceName, st, ht))
+		}
+	}
+	m.register(desc, ss)
+}
+
+func (m HandlerMap) register(desc *grpc.ServiceDesc, ss interface{}) {
+	if _, ok := m[desc.ServiceName]; ok {
+		panic(fmt.Sprintf("service %s: handler already registered", desc.ServiceName))
+	}
+	info := &serviceInfo{
+		serviceImpl: ss,
+		methods:     make(map[string]*grpc.MethodDesc),
+		streams:     make(map[string]*grpc.StreamDesc),
+		mdata:       desc.Metadata,
+	}
+	for i := range desc.Methods {
+		d := &desc.Methods[i]
+		info.methods[d.MethodName] = d
+	}
+	for i := range desc.Streams {
+		d := &desc.Streams[i]
+		info.streams[d.StreamName] = d
+	}
+	m[desc.ServiceName] = info
+}
+
+// GetServiceInfo returns a map from service names to ServiceInfo.
+// Service names include the package names, in the form of <package>.<service>.
+func (m HandlerMap) GetServiceInfo() map[string]grpc.ServiceInfo {
+	ret := make(map[string]grpc.ServiceInfo)
+	for n, srv := range m {
+		methods := make([]grpc.MethodInfo, 0, len(srv.methods)+len(srv.streams))
+		for m := range srv.methods {
+			methods = append(methods, grpc.MethodInfo{
+				Name:           m,
+				IsClientStream: false,
+				IsServerStream: false,
+			})
+		}
+		for m, d := range srv.streams {
+			methods = append(methods, grpc.MethodInfo{
+				Name:           m,
+				IsClientStream: d.ClientStreams,
+				IsServerStream: d.ServerStreams,
+			})
+		}
+
+		ret[n] = grpc.ServiceInfo{
+			Methods:  methods,
+			Metadata: srv.mdata,
+		}
+	}
+	return ret
 }
