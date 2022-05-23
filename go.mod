@@ -1,4 +1,4 @@
-module snple.com/rgrpc
+module github.com/snple/rgrpc
 
 go 1.18
 

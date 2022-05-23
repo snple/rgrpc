@@ -22,15 +22,7 @@ const _ = grpc.SupportPackageIsVersion7
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type RgrpcServiceClient interface {
-	// OpenTunnel creates a channel to the server which can be used to send
-	// additional RPCs, all of which will be sent to the same server via a
-	// single underlying gRPC stream. This can provide affinity for a "chatty"
-	// sequence of calls, where the gRPC connection is load balanced (so there
-	// may be multiple backend servers), but a particular "conversation" (which
-	// may consist of numerous RPCs) needs to all go to a single server, for
-	// consistency.
-	// rpc OpenTunnel(stream ClientToServer) returns (stream ServerToClient);
-	// OpenReverseTunnel creates a "reverse" channel, which allows the server to
+	// OpenRgrpc creates a "reverse" channel, which allows the server to
 	// act as a client and send RPCs to the client that creates the tunnel. It
 	// is in most respects identical to OpenTunnel except that the roles are
 	// reversed: the server initiates RPCs and sends requests and the client
@@ -81,15 +73,7 @@ func (x *rgrpcServiceOpenRgrpcClient) Recv() (*ClientToServer, error) {
 // All implementations must embed UnimplementedRgrpcServiceServer
 // for forward compatibility
 type RgrpcServiceServer interface {
-	// OpenTunnel creates a channel to the server which can be used to send
-	// additional RPCs, all of which will be sent to the same server via a
-	// single underlying gRPC stream. This can provide affinity for a "chatty"
-	// sequence of calls, where the gRPC connection is load balanced (so there
-	// may be multiple backend servers), but a particular "conversation" (which
-	// may consist of numerous RPCs) needs to all go to a single server, for
-	// consistency.
-	// rpc OpenTunnel(stream ClientToServer) returns (stream ServerToClient);
-	// OpenReverseTunnel creates a "reverse" channel, which allows the server to
+	// OpenRgrpc creates a "reverse" channel, which allows the server to
 	// act as a client and send RPCs to the client that creates the tunnel. It
 	// is in most respects identical to OpenTunnel except that the roles are
 	// reversed: the server initiates RPCs and sends requests and the client
