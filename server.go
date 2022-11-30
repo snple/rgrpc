@@ -31,43 +31,34 @@ const maxChunkSize = 16384
 // On return the provided stream should be canceled as soon as possible. Typical
 // usage looks like so:
 //
-//    ctx, cancel := context.WithCancel(ctx)
-//    defer cancel()
-//    stream, err := stub.OpenRgrpc(ctx)
-//    if err != nil {
-//        return err
-//    }
-//    return rgrpc.ServeChannel(stream, handlers)
-//
-func ServeChannel(stream RgrpcService_OpenRgrpcClient, handlers HandlerMap) error {
-	return serveChannel(stream, handlers)
-}
-
-// TODO: how to expose API to allow for graceful shutdown? Maybe above functions
-// should return the server, whose serve method could be exported. It could also
-// provide a Stop and GracefulStop method. If requests are received while the
-// channel is in graceful-stopping mode, it could immediately fail them with an
-// "unavailable" response code.
-
-func serveChannel(stream streamServer, handlers HandlerMap) error {
+//	ctx, cancel := context.WithCancel(ctx)
+//	defer cancel()
+//	stream, err := stub.OpenRgrpc(ctx)
+//	if err != nil {
+//	    return err
+//	}
+//	return rgrpc.Serve(stream, handlers)
+func Serve(stream RgrpcService_OpenRgrpcClient, handlers HandlerMap, isClosing func() bool) error {
 	svr := &ServerChannel{
-		stream:   stream,
-		services: handlers,
-		streams:  map[int64]*serverStream{},
-		lastSeen: -1,
+		stream:    stream,
+		services:  handlers,
+		isClosing: isClosing,
+		streams:   map[int64]*serverStream{},
+		lastSeen:  -1,
 	}
 	return svr.serve()
 }
 
 type streamServer interface {
-	grpc.Stream
+	Context() context.Context
 	Send(*ServerToClient) error
 	Recv() (*ClientToServer, error)
 }
 
 type ServerChannel struct {
-	stream   streamServer
-	services HandlerMap
+	stream    streamServer
+	services  HandlerMap
+	isClosing func() bool
 
 	mu       sync.RWMutex
 	streams  map[int64]*serverStream
@@ -93,7 +84,7 @@ func (s *ServerChannel) serve() error {
 				}
 
 				st, _ := status.FromError(err)
-				s.stream.Send(&ServerToClient{
+				_ = s.stream.Send(&ServerToClient{
 					StreamId: in.StreamId,
 					Frame: &ServerToClient_CloseStream{
 						CloseStream: &CloseStream{
@@ -115,6 +106,10 @@ func (s *ServerChannel) serve() error {
 }
 
 func (s *ServerChannel) createStream(ctx context.Context, streamID int64, frame *NewStream) (bool, error) {
+	if s.isClosing() {
+		return true, status.Errorf(codes.Unavailable, "server is shutting down")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -352,7 +347,7 @@ func toProto(md metadata.MD) *Metadata {
 }
 
 func (st *serverStream) SetTrailer(md metadata.MD) {
-	st.setTrailer(md)
+	_ = st.setTrailer(md)
 }
 
 func (st *serverStream) setTrailer(md metadata.MD) error {
@@ -375,7 +370,9 @@ func (st *serverStream) SendMsg(m interface{}) error {
 	defer st.writeMu.Unlock()
 
 	if !st.sentHeaders {
-		st.sendHeadersLocked()
+		if err := st.sendHeadersLocked(); err != nil {
+			return err
+		}
 	}
 
 	if !st.isServerStream && st.numSent == 1 {
@@ -584,11 +581,11 @@ func (st *serverStream) finishStream(err error) {
 	}
 
 	if !st.sentHeaders {
-		st.sendHeadersLocked()
+		_ = st.sendHeadersLocked()
 	}
 
 	stat, _ := status.FromError(err)
-	st.stream.Send(&ServerToClient{
+	_ = st.stream.Send(&ServerToClient{
 		StreamId: st.streamID,
 		Frame: &ServerToClient_CloseStream{
 			CloseStream: &CloseStream{

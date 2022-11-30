@@ -21,7 +21,7 @@ func TestTunnelServer(t *testing.T) {
 
 	ready := make(chan struct{})
 	ts := RrpcService{
-		OnChannelConnect: func(*ClientChannel) {
+		OnChannelConnect: func(*Client) {
 			// don't block; just make sure there's something in the channel
 			select {
 			case ready <- struct{}{}:
@@ -58,7 +58,7 @@ func TestTunnelServer(t *testing.T) {
 		grpchantesting.RegisterHandlerTestService(handlerMap, &svr)
 		errs := make(chan error)
 		go func() {
-			errs <- ServeChannel(stream, handlerMap)
+			errs <- Serve(stream, handlerMap, func() bool { return false })
 		}()
 
 		defer func() {
@@ -122,14 +122,14 @@ type RrpcService struct {
 	// NoReverseTunnels bool
 	// If reverse tunnels are allowed, this callback may be configured to
 	// receive information when clients open a reverse tunnel.
-	OnChannelConnect func(*ClientChannel)
+	OnChannelConnect func(*Client)
 	// If reverse tunnels are allowed, this callback may be configured to
 	// receive information when reverse tunnels are torn down.
-	OnChannelDisconnect func(*ClientChannel)
+	OnChannelDisconnect func(*Client)
 	// Optional function that accepts a reverse tunnel and returns an affinity
 	// key. The affinity key values can be used to look up outbound channels,
 	// for targeting calls to particular clients or groups of clients.
-	AffinityKey func(*ClientChannel) any
+	AffinityKey func(*Client) any
 
 	channels Channels
 
@@ -142,7 +142,7 @@ type RrpcService struct {
 var _ RgrpcServiceServer = (*RrpcService)(nil)
 
 func (s *RrpcService) OpenRgrpc(stream RgrpcService_OpenRgrpcServer) error {
-	ch := NewClientChannel(stream)
+	ch := NewClient(stream)
 	defer ch.Close()
 
 	var key any
@@ -183,15 +183,15 @@ func (s *RrpcService) OpenRgrpc(stream RgrpcService_OpenRgrpcServer) error {
 
 type Channels struct {
 	mu    sync.Mutex
-	chans []*ClientChannel
+	chans []*Client
 	idx   int
 }
 
-func (c *Channels) allChans() []*ClientChannel {
+func (c *Channels) allChans() []*Client {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	cp := make([]*ClientChannel, len(c.chans))
+	cp := make([]*Client, len(c.chans))
 	copy(cp, c.chans)
 	return cp
 }
@@ -214,14 +214,14 @@ func (c *Channels) pick() grpc.ClientConnInterface {
 	return c.chans[c.idx]
 }
 
-func (c *Channels) add(ch *ClientChannel) {
+func (c *Channels) add(ch *Client) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.chans = append(c.chans, ch)
 }
 
-func (c *Channels) remove(ch *ClientChannel) {
+func (c *Channels) remove(ch *Client) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -233,7 +233,7 @@ func (c *Channels) remove(ch *ClientChannel) {
 	}
 }
 
-func (s *RrpcService) AllTunnels() []*ClientChannel {
+func (s *RrpcService) AllTunnels() []*Client {
 	return s.channels.allChans()
 }
 
@@ -247,7 +247,7 @@ func (s *RrpcService) KeyAsChannel(key any) grpc.ClientConnInterface {
 	})
 }
 
-func (s *RrpcService) FindChannel(search func(*ClientChannel) bool) *ClientChannel {
+func (s *RrpcService) FindChannel(search func(*Client) bool) *Client {
 	allChans := s.channels.allChans()
 
 	for _, ch := range allChans {

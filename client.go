@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	reflect "reflect"
 	"sync"
 
 	"github.com/golang/protobuf/proto"
@@ -16,17 +17,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func NewClientChannel(stream RgrpcService_OpenRgrpcServer) *ClientChannel {
-	return newClientChannel(stream)
-}
-
 type streamClient interface {
-	grpc.Stream
+	Context() context.Context
 	Send(*ClientToServer) error
 	Recv() (*ServerToClient, error)
 }
 
-type ClientChannel struct {
+type Client struct {
 	stream streamClient
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -42,12 +39,12 @@ type ClientChannel struct {
 	RequestHeaders metadata.MD
 }
 
-func newClientChannel(stream streamClient) *ClientChannel {
+func NewClient(stream RgrpcService_OpenRgrpcServer) *Client {
 	p, _ := peer.FromContext(stream.Context())
 	md, _ := metadata.FromIncomingContext(stream.Context())
 
 	ctx, cancel := context.WithCancel(stream.Context())
-	c := &ClientChannel{
+	c := &Client{
 		stream:         stream,
 		ctx:            ctx,
 		cancel:         cancel,
@@ -59,15 +56,15 @@ func newClientChannel(stream streamClient) *ClientChannel {
 	return c
 }
 
-func (c *ClientChannel) Context() context.Context {
+func (c *Client) Context() context.Context {
 	return c.ctx
 }
 
-func (c *ClientChannel) Done() <-chan struct{} {
+func (c *Client) Done() <-chan struct{} {
 	return c.ctx.Done()
 }
 
-func (c *ClientChannel) IsDone() bool {
+func (c *Client) IsDone() bool {
 	if c.ctx.Err() != nil {
 		return true
 	}
@@ -76,7 +73,7 @@ func (c *ClientChannel) IsDone() bool {
 	return c.finished
 }
 
-func (c *ClientChannel) Err() error {
+func (c *Client) Err() error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	switch c.err {
@@ -89,11 +86,11 @@ func (c *ClientChannel) Err() error {
 	}
 }
 
-func (c *ClientChannel) Close() {
+func (c *Client) Close() {
 	c.close(nil)
 }
 
-func (c *ClientChannel) Invoke(ctx context.Context, methodName string, req, resp interface{}, opts ...grpc.CallOption) error {
+func (c *Client) Invoke(ctx context.Context, methodName string, req, resp interface{}, opts ...grpc.CallOption) error {
 	str, err := c.newStream(ctx, false, false, methodName, opts...)
 	if err != nil {
 		return err
@@ -104,19 +101,38 @@ func (c *ClientChannel) Invoke(ctx context.Context, methodName string, req, resp
 	if err := str.CloseSend(); err != nil {
 		return err
 	}
-	return str.RecvMsg(resp)
+	err = str.RecvMsg(resp)
+	if err != nil {
+		return err
+	}
+
+	// Make sure there are no more messages on the stream.
+	// Allocate another response (to make sure this call to
+	// RecvMsg can't modify the resp we already received).
+	rv := reflect.Indirect(reflect.ValueOf(resp))
+	extraResp := reflect.New(rv.Type()).Interface()
+	extraErr := str.RecvMsg(extraResp)
+	switch extraErr {
+	case nil:
+		return status.Errorf(codes.Internal, "unary RPC returned >1 response message")
+	case io.EOF:
+		// this is what we want: nothing else in the stream
+		return nil
+	default:
+		return err
+	}
 }
 
-func (c *ClientChannel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodName string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+func (c *Client) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodName string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 	return c.newStream(ctx, desc.ClientStreams, desc.ServerStreams, methodName, opts...)
 }
 
-func (c *ClientChannel) newStream(ctx context.Context, clientStreams, serverStreams bool, methodName string, opts ...grpc.CallOption) (*clientStream, error) {
+func (c *Client) newStream(ctx context.Context, clientStreams, serverStreams bool, methodName string, opts ...grpc.CallOption) (*clientStream, error) {
 	str, md, err := c.allocateStream(ctx, clientStreams, serverStreams, methodName, opts)
 	if err != nil {
 		return nil, err
 	}
-	err = c.stream.SendMsg(&ClientToServer{
+	err = c.stream.Send(&ClientToServer{
 		StreamId: str.streamID,
 		Frame: &ClientToServer_NewStream{
 			NewStream: &NewStream{
@@ -138,7 +154,7 @@ func (c *ClientChannel) newStream(ctx context.Context, clientStreams, serverStre
 	return str, nil
 }
 
-func (c *ClientChannel) allocateStream(ctx context.Context, clientStreams, serverStreams bool, methodName string, opts []grpc.CallOption) (*clientStream, metadata.MD, error) {
+func (c *Client) allocateStream(ctx context.Context, clientStreams, serverStreams bool, methodName string, opts []grpc.CallOption) (*clientStream, metadata.MD, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -224,7 +240,7 @@ func (c *ClientChannel) allocateStream(ctx context.Context, clientStreams, serve
 	return str, md, nil
 }
 
-func (c *ClientChannel) recvLoop() {
+func (c *Client) recvLoop() {
 	for {
 		in, err := c.stream.Recv()
 		if err != nil {
@@ -240,7 +256,7 @@ func (c *ClientChannel) recvLoop() {
 	}
 }
 
-func (c *ClientChannel) getStream(streamID int64) (*clientStream, error) {
+func (c *Client) getStream(streamID int64) (*clientStream, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -257,7 +273,7 @@ func (c *ClientChannel) getStream(streamID int64) (*clientStream, error) {
 	return target, nil
 }
 
-func (c *ClientChannel) removeStream(streamID int64) {
+func (c *Client) removeStream(streamID int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.streams != nil {
@@ -265,7 +281,7 @@ func (c *ClientChannel) removeStream(streamID int64) {
 	}
 }
 
-func (c *ClientChannel) close(err error) bool {
+func (c *Client) close(err error) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -290,7 +306,7 @@ func (c *ClientChannel) close(err error) bool {
 type clientStream struct {
 	ctx      context.Context
 	cncl     context.CancelFunc
-	ch       *ClientChannel
+	ch       *Client
 	streamID int64
 	method   string
 	stream   streamClient
@@ -587,7 +603,7 @@ func (st *clientStream) cancel(err error) {
 	// let server know
 	st.writeMu.Lock()
 	defer st.writeMu.Unlock()
-	st.stream.Send(&ClientToServer{
+	_ = st.stream.Send(&ClientToServer{
 		StreamId: st.streamID,
 		Frame: &ClientToServer_Cancel{
 			Cancel: &empty.Empty{},
