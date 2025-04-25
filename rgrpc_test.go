@@ -11,6 +11,8 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
@@ -34,16 +36,29 @@ func TestTunnelServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	gs := grpc.NewServer()
+	gs := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
 	RegisterRgrpcServiceServer(gs, &ts)
 	go gs.Serve(l)
 	defer gs.Stop()
 
-	cc, err := grpc.Dial(l.Addr().String(), grpc.WithBlock(), grpc.WithInsecure())
+	cc, err := grpc.NewClient(l.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
 	defer cc.Close()
+
+	for {
+		s := cc.GetState()
+		if s == connectivity.Idle {
+			cc.Connect()
+		}
+		if s == connectivity.Ready {
+			break
+		}
+		if !cc.WaitForStateChange(context.Background(), s) {
+			t.Fatalf("failed to connect to server")
+		}
+	}
 
 	cli := NewRgrpcServiceClient(cc)
 
@@ -55,7 +70,7 @@ func TestTunnelServer(t *testing.T) {
 
 		// client now acts as the server
 		handlerMap := HandlerMap{}
-		grpchantesting.RegisterHandlerTestService(handlerMap, &svr)
+		grpchantesting.RegisterTestServiceServer(handlerMap, &svr)
 		errs := make(chan error)
 		go func() {
 			errs <- Serve(stream, handlerMap, func() bool { return false })
